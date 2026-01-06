@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ReleasePilot</title>
+  <meta name="theme-color" content="#000000" />
+
+  <style>
+    :root { color-scheme: dark; }
+    body { margin:0; font-family: -apple-system, system-ui, Segoe UI, Roboto, Arial; background:#000; color:#fff; }
+    .wrap { max-width: 920px; margin: 0 auto; padding: 18px; }
+    h1 { margin: 6px 0 2px; font-size: 20px; font-weight: 650; letter-spacing: .2px; }
+    .sub { margin: 0 0 14px; opacity:.75; font-size: 13px; }
+    textarea { width: 100%; min-height: 170px; resize: vertical; background:#0b0b0b; color:#fff; border:1px solid #222; border-radius: 12px; padding: 12px; line-height: 1.35; }
+    .row { display:flex; gap:10px; flex-wrap: wrap; margin: 12px 0; }
+    select, button { background:#0b0b0b; color:#fff; border:1px solid #222; border-radius: 12px; padding: 10px 12px; }
+    button { cursor:pointer; }
+    button:hover { border-color:#444; }
+    .card { background:#0b0b0b; border:1px solid #222; border-radius: 12px; padding: 12px; margin-top: 12px; }
+    .out { white-space: pre-wrap; word-break: break-word; line-height: 1.35; }
+    .small { font-size: 12px; opacity:.75; }
+    .pill { display:inline-block; padding: 4px 8px; border:1px solid #222; border-radius: 999px; font-size:12px; opacity:.8; }
+    .hr { height:1px; background:#1a1a1a; margin: 12px 0; }
+  </style>
+</head>
+
+<body>
+  <div class="wrap">
+    <h1>ReleasePilot</h1>
+    <p class="sub">Offline-first. “IA semplificata” = regole, template, estrazione, riscrittura. Zero cloud.</p>
+
+    <textarea id="input" placeholder="Incolla qui un testo (mail, appunti, caption, briefing, ecc.)"></textarea>
+
+    <div class="row">
+      <label class="pill">Azione</label>
+      <select id="mode">
+        <option value="summary">Riassumi (corto)</option>
+        <option value="bullets">Punti chiave</option>
+        <option value="todo">Estrai To-Do</option>
+        <option value="clean">Ripulisci testo</option>
+        <option value="reply">3 Risposte pronte</option>
+        <option value="caption">3 Caption minimal</option>
+      </select>
+
+      <label class="pill">Tono</label>
+      <select id="tone">
+        <option value="neutral">Neutro</option>
+        <option value="warm">Caldo</option>
+        <option value="firm">Deciso</option>
+        <option value="minimal">Minimal</option>
+      </select>
+
+      <button id="run">Genera</button>
+      <button id="copy">Copia output</button>
+      <button id="clear">Svuota</button>
+    </div>
+
+    <div class="card">
+      <div class="small">Output</div>
+      <div class="hr"></div>
+      <div id="output" class="out"></div>
+    </div>
+
+    <p class="small" id="status"></p>
+  </div>
+
+<script>
+  // --- PWA offline ---
+  (async () => {
+    const status = document.getElementById('status');
+    if ('serviceWorker' in navigator) {
+      try {
+        await navigator.serviceWorker.register('./sw.js');
+        status.textContent = 'Offline attivo (service worker registrato).';
+      } catch (e) {
+        status.textContent = 'Offline non attivo: ' + (e?.message || e);
+      }
+    } else {
+      status.textContent = 'Service worker non supportato su questo browser.';
+    }
+  })();
+
+  // --- “IA semplificata” offline: utilità testo ---
+  const $ = (id) => document.getElementById(id);
+
+  function normalizeSpaces(s) {
+    return s
+      .replace(/\r\n/g, '\n')
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .replace(/[ \t]{2,}/g, ' ')
+      .trim();
+  }
+
+  function splitSentences(text) {
+    // euristica semplice, robusta per testi “normali”
+    const t = normalizeSpaces(text);
+    const parts = t.split(/(?<=[\.\!\?\:])\s+|\n+/g).map(x => x.trim()).filter(Boolean);
+    return parts.length ? parts : (t ? [t] : []);
+  }
+
+  function topKeywords(text, n=8) {
+    const stop = new Set([
+      "il","lo","la","i","gli","le","un","uno","una","di","a","da","in","con","su","per","tra","fra",
+      "che","e","o","ma","se","non","più","meno","del","della","dei","delle","al","allo","alla","ai","agli","alle",
+      "mi","ti","si","ci","vi","ne","io","tu","lui","lei","noi","voi","loro",
+      "this","that","the","and","or","but","to","of","in","on","for","with","is","are","was","were","be"
+    ]);
+
+    const words = normalizeSpaces(text.toLowerCase())
+      .replace(/[^a-zàèéìòù0-9\s]/gi, ' ')
+      .split(/\s+/)
+      .filter(w => w.length >= 4 && !stop.has(w));
+
+    const freq = new Map();
+    for (const w of words) freq.set(w, (freq.get(w)||0) + 1);
+
+    return [...freq.entries()]
+      .sort((a,b) => b[1]-a[1])
+      .slice(0,n)
+      .map(([w,c]) => w);
+  }
+
+  function summarizeShort(text, maxSentences=3) {
+    const sents = splitSentences(text);
+    if (sents.length <= maxSentences) return sents.join('\n');
+    // euristica: preferisci frasi che contengono keyword
+    const keys = new Set(topKeywords(text, 10));
+    const scored = sents.map((s, idx) => {
+      const w = s.toLowerCase().replace(/[^a-zàèéìòù0-9\s]/gi,' ').split(/\s+/);
+      let score = 0;
+      for (const x of w) if (keys.has(x)) score += 1;
+      // piccolo bonus alle prime frasi (spesso contesto)
+      score += Math.max(0, (maxSentences - idx*0.2));
+      return { s, idx, score };
+    }).sort((a,b)=> b.score-a.score).slice(0, maxSentences).sort((a,b)=> a.idx-b.idx);
+    return scored.map(x => x.s).join('\n');
+  }
+
+  function bullets(text, max=7) {
+    const sents = splitSentences(text);
+    const take = sents.slice(0, max);
+    return take.map(s => `• ${s}`).join('\n');
+  }
+
+  function extractTodos(text) {
+    const lines = normalizeSpaces(text).split('\n').map(l => l.trim()).filter(Boolean);
+    const out = [];
+    const todoRegex = /(^\s*[-•\*]\s+)|\b(devo|da fare|to-do|todo|call|chiama|invia|manda|spedire|conferma|verifica|check|aggiorna|prenota|paga|fattura|preventivo)\b/i;
+
+    for (const l of lines) {
+      if (todoRegex.test(l) && l.length >= 6) out.push(l.replace(/^[-•\*]\s+/, ''));
+    }
+    if (!out.length) {
+      // fallback: prova a prendere frasi imperative brevi
+      const sents = splitSentences(text);
+      for (const s of sents) {
+        if (/\b(invia|manda|chiama|scrivi|verifica|controlla|aggiorna|conferma|prenota|paga)\b/i.test(s)) out.push(s);
+        if (out.length >= 8) break;
+      }
+    }
+    return out.length ? out.map(x => `☐ ${x}`).join('\n') : 'Nessun To-Do evidente trovato.';
+  }
+
+  function cleanText(text, tone) {
+    let t = normalizeSpaces(text);
+    // micro-regole per tono (senza “inventare” contenuti)
+    if (tone === 'minimal') {
+      t = t.replace(/\b(molto|veramente|assolutamente|praticamente|in pratica)\b/gi, '').replace(/[ ]{2,}/g,' ');
+    }
+    if (tone === 'firm') {
+      t = t.replace(/\bforse\b/gi, '').replace(/\bmagari\b/gi, '');
+    }
+    if (tone === 'warm') {
+      // aggiunge solo un saluto/chiusura se sembra una mail e non ci sono già
+      const hasGreeting = /\b(ciao|buongiorno|buonasera)\b/i.test(t);
+      if (!hasGreeting && t.length > 60) t = `Ciao,\n\n${t}`;
+      const hasThanks = /\b(grazie)\b/i.test(t);
+      if (!hasThanks && t.length > 60) t = `${t}\n\nGrazie!`;
+    }
+    return t.trim();
+  }
+
+  function threeReplies(text, tone) {
+    const sum = summarizeShort(text, 2);
+    const keys = topKeywords(text, 6).join(', ');
+    const base = {
+      neutral: [
+        `Ricevuto. Mi prendo un attimo e ti aggiorno a breve.\n\nSintesi: ${sum}`,
+        `Grazie, confermo. Procedo come indicato.\n\nPunti: ${keys}`,
+        `Ok. Mi servono due dettagli per chiudere:\n1) …\n2) …`
+      ],
+      warm: [
+        `Grazie! Ricevuto 😊\n\nSintesi: ${sum}\nTi aggiorno a breve.`,
+        `Perfetto, grazie. Procedo.\nSe manca qualcosa dimmelo pure.`,
+        `Va benissimo. Mi confermi solo:\n1) …\n2) …\nGrazie!`
+      ],
+      firm: [
+        `Ricevuto. Procedo e invio conferma entro oggi.`,
+        `Ok. Per andare avanti mi servono questi dati:\n1) …\n2) …`,
+        `Confermato. Se ci sono variazioni, avvisami prima della chiusura.`
+      ],
+      minimal: [
+        `Ricevuto. Ti aggiorno.`,
+        `Ok. Confermo.`,
+        `Mi servono 2 dettagli:\n1) …\n2) …`
+      ]
+    };
+    return base[tone].map((x,i)=>`${i+1}) ${x}`).join('\n\n');
+  }
+
+  function threeCaptions(text, tone) {
+    const sum = summarizeShort(text, 1);
+    const keys = topKeywords(text, 5);
+    const k = keys.length ? keys.join(' · ') : '';
+    const variants = {
+      neutral: [
+        `${sum}\n${k}`.trim(),
+        `${sum}\n\n${k ? '#'+keys.join(' #') : ''}`.trim(),
+        `${sum}`.trim()
+      ],
+      warm: [
+        `${sum}\n\nGrazie a chi c’è. ${k}`.trim(),
+        `${sum}\n\nUn passo alla volta. ${k}`.trim(),
+        `${sum}\n\n🤍`.trim()
+      ],
+      firm: [
+        `${sum}\n\nDirezione chiara. ${k}`.trim(),
+        `${sum}\n\nFatto. Avanti.`.trim(),
+        `${sum}\n\nFocus.`.trim()
+      ],
+      minimal: [
+        `${sum}`.trim(),
+        `${k}`.trim() || `${sum}`.trim(),
+        `${sum}\n\n.`.trim()
+      ]
+    };
+    return variants[tone].map((x,i)=>`${i+1}) ${x}`).join('\n\n');
+  }
+
+  function run() {
+    const input = $('input').value || '';
+    const mode = $('mode').value;
+    const tone = $('tone').value;
+
+    if (!input.trim()) {
+      $('output').textContent = 'Incolla un testo per iniziare.';
+      return;
+    }
+
+    let out = '';
+    switch (mode) {
+      case 'summary': out = summarizeShort(input, 3); break;
+      case 'bullets': out = bullets(input, 7); break;
+      case 'todo': out = extractTodos(input); break;
+      case 'clean': out = cleanText(input, tone); break;
+      case 'reply': out = threeReplies(input, tone); break;
+      case 'caption': out = threeCaptions(input, tone); break;
+      default: out = summarizeShort(input, 3);
+    }
+    $('output').textContent = out;
+  }
+
+  $('run').addEventListener('click', run);
+  $('clear').addEventListener('click', () => { $('input').value=''; $('output').textContent=''; });
+  $('copy').addEventListener('click', async () => {
+    const text = $('output').textContent || '';
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      $('status').textContent = 'Copiato negli appunti.';
+      setTimeout(()=> $('status').textContent = $('status').textContent, 500);
+    } catch {
+      $('status').textContent = 'Copia non disponibile: seleziona e copia manualmente.';
+    }
+  });
+
+  // Ctrl/Cmd+Enter per generare
+  $('input').addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') run();
+  });
+</script>
+</body>
+</html>
